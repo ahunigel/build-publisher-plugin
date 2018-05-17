@@ -1,11 +1,13 @@
 package hudson.plugins.build_publisher;
 
+import com.google.common.collect.Maps;
 import hudson.Functions;
 import hudson.Util;
 import hudson.matrix.MatrixConfiguration;
 import hudson.maven.MavenModule;
 import hudson.model.AbstractBuild;
 import hudson.model.AbstractProject;
+import net.sf.json.JSONObject;
 import org.apache.commons.httpclient.Header;
 import org.apache.commons.httpclient.HttpClient;
 import org.apache.commons.httpclient.HttpMethodBase;
@@ -13,6 +15,7 @@ import org.apache.commons.httpclient.HttpMethod;
 import org.apache.commons.httpclient.methods.FileRequestEntity;
 import org.apache.commons.httpclient.methods.GetMethod;
 import org.apache.commons.httpclient.methods.PostMethod;
+import org.apache.commons.io.IOUtils;
 import org.apache.tools.ant.DirectoryScanner;
 import org.apache.tools.ant.types.FileSet;
 import org.apache.tools.tar.TarEntry;
@@ -26,6 +29,7 @@ import java.io.FileOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.util.Map;
 import java.util.logging.Level;
 import org.apache.commons.httpclient.HttpException;
 
@@ -35,30 +39,33 @@ import org.apache.commons.httpclient.HttpException;
  */
 public class HTTPBuildTransmitter implements BuildTransmitter {
 
+    private static boolean useCrumbs = true;
+    private static Map<HudsonInstance, Header> crumbCache = Maps.newHashMap();
+
     private PostMethod method;
     private boolean aborted = false;
 
     public void sendBuild(AbstractBuild build, HudsonInstance hudsonInstance)
-            throws ServerFailureException {
+        throws ServerFailureException {
 
         aborted = false;
         AbstractProject project = build.getProject();
-        
+
         String jobUrl = "job/";
         if (project instanceof MavenModule) {
             jobUrl += hudson.Util.rawEncode(((MavenModule) project).getParent().getName())
-                    + "/"
-                    + hudson.Util.rawEncode(((MavenModule) project).getModuleName().toFileSystemName());
+                + "/"
+                + hudson.Util.rawEncode(((MavenModule) project).getModuleName().toFileSystemName());
         } else if (project instanceof MatrixConfiguration) {
             jobUrl += hudson.Util.rawEncode(((MatrixConfiguration)project).getParent().getName())
-                    + "/"
-                    + Util.rawEncode(((MatrixConfiguration)project).getCombination().toString());
+                + "/"
+                + Util.rawEncode(((MatrixConfiguration)project).getCombination().toString());
         } else {
             jobUrl += hudson.Util.rawEncode(project.getName());
         }
 
         method = new PostMethod(hudsonInstance.getUrl()
-                + jobUrl + "/postBuild/acceptBuild");
+            + jobUrl + "/postBuild/acceptBuild");
 
         File tempFile = null;
         OutputStream out = null;
@@ -67,21 +74,21 @@ public class HTTPBuildTransmitter implements BuildTransmitter {
             tempFile = File.createTempFile("hudson_bp", ".tar");
             out = new FileOutputStream(tempFile);
             writeToTar(out, build);
-            
+
             method.setRequestEntity(new FileRequestEntity(tempFile,
-                    "application/x-tar"));
-            
+                "application/x-tar"));
+
             method.setRequestHeader("X-Build-Number", String.valueOf(build.getNumber()));
 
             executeMethod(method, hudsonInstance);
-            
+
             //Check if remote side really accepted the build
             Header responseHeader = method.getResponseHeader("X-Build-Recieved");
-            if((responseHeader == null) || 
-                    !project.getName().equals(responseHeader.getValue().trim())) {
-                    throw new HttpException("Remote instance didn't confirm receiving this build");
+            if((responseHeader == null) ||
+                !project.getName().equals(responseHeader.getValue().trim())) {
+                throw new HttpException("Remote instance didn't confirm recieving this build");
             }
-            
+
         } catch (IOException e) {
             // May be caused by premature call of HttpMethod.abort()
             if (!aborted) {
@@ -100,8 +107,8 @@ public class HTTPBuildTransmitter implements BuildTransmitter {
                 }
             if (!tempFile.delete()) {
                 HudsonInstance.LOGGER.log(Level.SEVERE, "Failed to delete temporary file "
-                        + tempFile.getAbsolutePath()
-                        + ". Please delete the file manually.");
+                    + tempFile.getAbsolutePath()
+                    + ". Please delete the file manually.");
             }
         }
 
@@ -130,7 +137,7 @@ public class HTTPBuildTransmitter implements BuildTransmitter {
      *      If we encounter >400 error code from the server.
      */
     static HttpMethod executeMethod(HttpMethodBase method,
-            HudsonInstance hudsonInstance) throws ServerFailureException {
+                                    HudsonInstance hudsonInstance) throws ServerFailureException {
         hudsonInstance.getHttpClient().getState().clear();
         if ((hudsonInstance.requiresAuthentication())) {
             // We need to get authenticated.
@@ -142,7 +149,7 @@ public class HTTPBuildTransmitter implements BuildTransmitter {
             // they clock the login link, which is most stable across different
             // environment
             GetMethod loginMethod = new GetMethod(hudsonInstance.getUrl()
-                    + "login");
+                + "login");
             followRedirects(loginMethod, hudsonInstance);
 
             try {
@@ -157,16 +164,16 @@ public class HTTPBuildTransmitter implements BuildTransmitter {
                     throw (acegy.getMethod().getStatusCode() == 404)
                         ? original
                         : acegy
-                    ;
+                        ;
                 }
             }
         }
 
         return followRedirects(method, hudsonInstance);
     }
-    
+
     private static void login(String type, HudsonInstance hudsonInstance)
-            throws ServerFailureException {
+        throws ServerFailureException {
         PostMethod servletSecurityMethod = new PostMethod(hudsonInstance.getUrl() + type);
         servletSecurityMethod.addParameter("j_username", hudsonInstance.getLogin());
         servletSecurityMethod.addParameter("j_password", hudsonInstance.getPassword());
@@ -174,12 +181,47 @@ public class HTTPBuildTransmitter implements BuildTransmitter {
         followRedirects(servletSecurityMethod, hudsonInstance);
     }
 
+    private static Header getCrumbHeader(HudsonInstance hudsonInstance, HttpClient client) {
+        Header crumbHeader = crumbCache.get(hudsonInstance);
+        HudsonInstance.LOGGER.log(Level.SEVERE, "Cached crumb header for " + hudsonInstance.getUrl()
+            + " is " + crumbHeader);
+//        if(crumbHeader != null) return crumbHeader;
+        HudsonInstance.LOGGER.log(Level.SEVERE, "Attempt to retrieve crumb header for " + hudsonInstance.getUrl());
+        String crumbProvider = hudsonInstance.getUrl() + "crumbIssuer/api/json";
+        GetMethod method = new GetMethod(crumbProvider);
+
+        try {
+            client.executeMethod(method);
+            String result = IOUtils.toString(method.getResponseBodyAsStream(), "UTF8");
+            JSONObject js = JSONObject.fromObject(result);
+
+            crumbHeader = new Header(js.getString("crumbRequestField"), js.getString("crumb"));
+            HudsonInstance.LOGGER.log(Level.SEVERE, "Retrieved new crumb header for " + hudsonInstance.getUrl()
+                + " is " + crumbHeader);
+            crumbCache.put(hudsonInstance, crumbHeader);
+        } catch (Exception e) {
+            // If getting the crumb fails disable crumb support. Not all instances have crumbs enabled
+            useCrumbs = false;
+        } finally {
+            method.releaseConnection();
+        }
+
+        return crumbHeader;
+    }
+
     // see executeMethod for contracts
     private static HttpMethod followRedirects(HttpMethodBase method,
-            HudsonInstance hudsonInstance) throws ServerFailureException {
+                                              HudsonInstance hudsonInstance) throws ServerFailureException {
         int statusCode;
         HttpClient client = hudsonInstance.getHttpClient();
         try {
+            if(useCrumbs) {
+                Header crumbHeader = getCrumbHeader(hudsonInstance, client);
+                HudsonInstance.LOGGER.log(Level.SEVERE, "Got crumb header: " + crumbHeader.getValue());
+                if(crumbHeader != null) {
+                    method.setRequestHeader(crumbHeader);
+                }
+            }
             statusCode = client.executeMethod(method);
 
             if(statusCode<300)
@@ -189,7 +231,7 @@ public class HTTPBuildTransmitter implements BuildTransmitter {
                 if (locationHeader != null) {
                     String redirectLocation = locationHeader.getValue();
                     method.setURI(new org.apache.commons.httpclient.URI(/*method.getURI(),*/ redirectLocation,
-                                    true));
+                        true));
                     return followRedirects(method, hudsonInstance);
                 }
             }
@@ -211,7 +253,7 @@ public class HTTPBuildTransmitter implements BuildTransmitter {
     // most of this is taken from somewhere of Hudson code. Perhaps it would be
     // good idea to put it in one place.
     private Integer writeToTar(OutputStream out, AbstractBuild build)
-            throws IOException {
+        throws IOException {
         File buildDir = build.getRootDir();
         File baseDir = buildDir.getParentFile();
         String buildXmlFile = buildDir.getName() + "/build.xml";
@@ -226,7 +268,7 @@ public class HTTPBuildTransmitter implements BuildTransmitter {
         tar.setLongFileMode(TarOutputStream.LONGFILE_GNU);
 
         DirectoryScanner dirScanner = fileSet
-                .getDirectoryScanner(new org.apache.tools.ant.Project());
+            .getDirectoryScanner(new org.apache.tools.ant.Project());
         String[] files = dirScanner.getIncludedFiles();
         for (String fileName : files) {
 
@@ -242,7 +284,7 @@ public class HTTPBuildTransmitter implements BuildTransmitter {
 
             if (!file.isDirectory()) {
                 writeStreamToTar(tar, new FileInputStream(file), fileName, file
-                        .length(), buffer);
+                    .length(), buffer);
             }
         }
 
@@ -250,39 +292,32 @@ public class HTTPBuildTransmitter implements BuildTransmitter {
         String buildXml = Util.loadFile(buildFile);
         byte[] bytes = buildXml.getBytes();
         writeStreamToTar(tar, new ByteArrayInputStream(bytes), buildXmlFile,
-                bytes.length, buffer);
+            bytes.length, buffer);
 
         tar.close();
 
         return files.length;
     }
 
-    /**
-     * Write buffer to tar.
-     *
-     * @param in The stream to read from. Will be closed upon method completion.
-     */
     private void writeStreamToTar(TarOutputStream tar, InputStream in,
-            String fileName, long length, byte[] buf
-    ) throws IOException {
-        try {
-            TarEntry te = new TarEntry(fileName);
-            te.setSize(length);
+                                  String fileName, long length, byte[] buf) throws IOException {
+        TarEntry te = new TarEntry(fileName);
+        te.setSize(length);
 
-            tar.putNextEntry(te);
+        tar.putNextEntry(te);
 
-            int len;
-            while ((len = in.read(buf)) >= 0) {
+        int len;
+        while ((len = in.read(buf)) >= 0) {
 
-                if (aborted) {
-                    break;
-                }
-
-                tar.write(buf, 0, len);
+            if (aborted) {
+                break;
             }
-            tar.closeEntry();
-        } finally {
-            in.close();
+
+            tar.write(buf, 0, len);
         }
+        tar.closeEntry();
+
+        in.close();
     }
+
 }
